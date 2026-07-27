@@ -7,3 +7,4 @@ data/marts/*.csv
 models/*.joblib
 .streamlit/
 .DS_Store
+data/raw/
