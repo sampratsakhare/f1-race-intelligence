@@ -243,8 +243,11 @@ def poll_loop(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Poll OpenF1 live session data into BigQuery")
-    parser.add_argument("--session-key", default="active",
-                         help="OpenF1 session_key, or 'active' (also accepts legacy 'latest')")
+    parser.add_argument(
+        "--session-key",
+        default="latest",
+        help="OpenF1 session_key, or the documented 'latest' selector",
+    )
     parser.add_argument("--poll-seconds", type=int, default=DEFAULT_POLL_SECONDS)
     parser.add_argument(
         "--max-polls",

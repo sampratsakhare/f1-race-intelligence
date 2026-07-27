@@ -162,12 +162,6 @@ class BigQueryLoader:
     ) -> None:
         """Streaming insert for live polling -- lower latency than batch load,
         appropriate for the small, frequent row counts live polling produces.
-
-        Streaming inserts require the table to already exist (unlike batch
-        loads, which can autodetect + create it). If the table doesn't exist
-        yet -- true the very first time a live session is polled -- fall
-        back to a one-off batch load to create it with an inferred schema,
-        then this and all subsequent calls stream normally.
         """
         if not rows:
             return
