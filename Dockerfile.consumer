@@ -1,0 +1,22 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+COPY requirements-consumer.txt .
+RUN pip install --upgrade pip \
+    && pip install -r requirements-consumer.txt
+
+COPY src ./src
+
+RUN addgroup --system app \
+    && adduser --system --ingroup app app \
+    && chown -R app:app /app
+USER app
+
+EXPOSE 8080
+
+CMD ["sh", "-c", "exec uvicorn src.stream.consumer_app:app --host 0.0.0.0 --port=${PORT:-8080}"]
