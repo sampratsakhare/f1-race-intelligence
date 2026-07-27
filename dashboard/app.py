@@ -52,6 +52,11 @@ def load_pit_analysis() -> pd.DataFrame:
 
 
 def load_live_laps() -> pd.DataFrame:
+    """Returns an empty DataFrame (rather than raising) if raw_live_laps
+    doesn't exist yet -- this table is only created once live_poller.py
+    has actually run during a live session. A missing table here just
+    means "no live session has been polled yet," not an error.
+    """
     client = get_client()
     query = f"""
         SELECT *
@@ -59,7 +64,10 @@ def load_live_laps() -> pd.DataFrame:
         ORDER BY date DESC
         LIMIT 50
     """
-    return client.query(query).to_dataframe()
+    try:
+        return client.query(query).to_dataframe()
+    except Exception:
+        return pd.DataFrame()
 
 
 st.title("F1 Race Intelligence")
@@ -107,17 +115,22 @@ with tab_historical:
 with tab_live:
     st.subheader("Live Lap Feed")
     st.caption(
-        "Populated by live_poller.py during an active session. "
-        "Refreshes automatically every 10 seconds."
+        "Populated by live_poller.py during a genuinely live session (requires a paid "
+        "OpenF1 account -- see README), or by replay_poller.py replaying historical "
+        "data at accelerated speed for demo purposes. This panel auto-refreshes "
+        "every 10 seconds while open."
     )
 
-    placeholder = st.empty()
-    refresh = st.button("Refresh now")
+    @st.fragment(run_every="10s")
+    def render_live_feed():
+        live_df = load_live_laps()
+        if live_df.empty:
+            st.info(
+                "No live data yet. Run `python -m src.ingest.live_poller` during a live "
+                "session, or `python -m src.ingest.replay_poller` to demo with historical data."
+            )
+        else:
+            st.dataframe(live_df, use_container_width=True)
+            st.caption(f"Last refreshed: {pd.Timestamp.now(tz='UTC').strftime('%H:%M:%S UTC')}")
 
-    if refresh:
-        with placeholder.container():
-            live_df = load_live_laps()
-            if live_df.empty:
-                st.info("No live data yet -- start live_poller.py during a session weekend.")
-            else:
-                st.dataframe(live_df, use_container_width=True)
+    render_live_feed()

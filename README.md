@@ -14,7 +14,10 @@ live-updating dashboard.
 ## Architecture
 
 ```
-OpenF1 API ──► historical_backfill.py ──► Cloud Storage (raw JSON)
+OpenF1 API ──► historical_backfill.py ──► local raw JSON (data/raw/)
+                                              │  (mirrors what a GCS bucket
+                                              │   would hold in production --
+                                              │   see "Known limitations" below)
                                               │
                                               ▼
                                      load_historical_to_bq.py
@@ -78,7 +81,7 @@ dashboard/
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # fill in GCP_PROJECT_ID etc.
-export $(cat .env | xargs)
+export $(cat .env | grep -v '^#' | xargs)
 ```
 
 You'll need a GCP project with the BigQuery API enabled and either:
@@ -111,10 +114,46 @@ python -m src.ml.train_model --input data/marts/driver_race_performance.csv
 streamlit run dashboard/app.py
 ```
 
-**5. (During a live race weekend) start the live poller**
+**5. Real-time data: two options**
+
+OpenF1's genuinely live (in-session) data now requires a paid account and
+bearer token (historical data stays free -- see openf1.org/auth.html).
+Two ways to demo the streaming architecture depending on whether you have one:
+
 ```bash
-python -m src.ingest.live_poller --session-key latest --poll-seconds 8
+# Option A: genuinely live, during an actual F1 session, with a paid account
+python -m src.ingest.live_poller --session-key active --poll-seconds 8 --access-token YOUR_TOKEN
+
+# Option B: replay a historical race through the same streaming path at
+# accelerated speed -- no paid access needed, works any time
+python -m src.ingest.replay_poller --year 2024 --meeting-key 1229 --session-key 9472 --speed 60
 ```
+
+Both write to the same `raw_live_*` BigQuery tables the dashboard's Live tab
+reads from, so the dashboard doesn't need to know which one produced the data.
+
+## Known limitations (read before presenting this)
+
+Being direct about what's a genuine gap here, rather than glossing over it:
+
+- **The ML model has a feature-leakage caveat.** Several features
+  (`avg_lap_seconds`, `pit_stop_count`, etc.) are computed from the race
+  whose outcome is being predicted -- this is a "what correlates with how
+  the race ended" model, not a true pre-race or in-race prediction system.
+  `train_model.py` reports a naive baseline (predict finish = start
+  position) alongside the model's MAE specifically so this gets evaluated
+  honestly rather than oversold. A proper fix would redefine the task with
+  a fixed horizon (e.g. "using only data through lap 10, predict final
+  position") built from cumulative, point-in-time features -- flagged as
+  future work, not yet built.
+- **Raw storage is local, not actually Cloud Storage.** `data/raw/` mirrors
+  what a GCS bucket would hold in a production version, but no GCS client
+  or upload path is implemented yet.
+- **Live access requires a paid OpenF1 account** (see above); `replay_poller.py`
+  is the practical workaround for demoing the real-time path without one.
+- **No automated tests, CI, or infrastructure-as-code.** This is a portfolio
+  build, not a production system -- see below for what a production version
+  would add.
 
 ## Scaling this up (what I'd add for production)
 
@@ -131,6 +170,13 @@ production setting I'd add:
   instead of a local joblib file
 - **Explicit BigQuery schemas** instead of autodetect, plus data quality
   checks (e.g. Great Expectations) on the staging layer
+- **A lap-indexed feature horizon** for the ML model (see limitation above),
+  so predictions are made from only the data available at that point in
+  the race, not the full race outcome
+- **pytest + GitHub Actions CI**, a Dockerfile, and Terraform for the GCP
+  resources, none of which exist yet in this portfolio version
+- **Actual GCS upload** in the ingestion path, replacing the local
+  `data/raw/` mirror described above
 
 ## Data sources
 

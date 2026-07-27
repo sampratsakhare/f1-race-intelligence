@@ -24,18 +24,31 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://api.openf1.org/v1"
 
 # Free tier: 3 req/s and 30 req/min. We stay well under that.
+# Note: in sustained multi-endpoint pulls across many race weekends, OpenF1
+# throttles harder than the nominal limit suggests, so we're conservative
+# here and retry with a longer backoff rather than giving up fast.
 MIN_SECONDS_BETWEEN_REQUESTS = 1.0
 MAX_RETRIES = 6
 BACKOFF_SECONDS = 3
 
 
 class OpenF1Client:
-    """Simple REST client for OpenF1 with basic rate limiting + retry."""
+    """Simple REST client for OpenF1 with basic rate limiting + retry.
 
-    def __init__(self, base_url: str = BASE_URL, session: requests.Session | None = None):
+    Historical data (30+ min after a session ends) is free, no auth needed.
+    Real-time data (during the live window) requires a paid OpenF1 account
+    and a bearer token -- see https://openf1.org/auth.html. Pass one via
+    access_token if you have one; without it, live endpoints will 401/403
+    during the live window (historical_backfill.py is unaffected).
+    """
+
+    def __init__(self, base_url: str = BASE_URL, session: requests.Session | None = None,
+                 access_token: str | None = None):
         self.base_url = base_url
         self.session = session or requests.Session()
         self._last_request_ts: float = 0.0
+        if access_token:
+            self.session.headers["Authorization"] = f"Bearer {access_token}"
 
     def _throttle(self) -> None:
         elapsed = time.monotonic() - self._last_request_ts
@@ -55,7 +68,7 @@ class OpenF1Client:
 
                 if resp.status_code == 429:
                     wait = BACKOFF_SECONDS * (2 ** (attempt - 1))
-                    logger.warning("Rate limited on %s, backing off %ss", endpoint, wait)
+                    logger.warning("Rate limited on %s, backing off %ss (attempt %d/%d)", endpoint, wait, attempt, MAX_RETRIES)
                     time.sleep(wait)
                     continue
 
@@ -65,7 +78,7 @@ class OpenF1Client:
             except requests.RequestException as exc:
                 last_err = exc
                 wait = BACKOFF_SECONDS * (2 ** (attempt - 1))
-                logger.warning("Request to %s failed (%s), retrying in %ss", endpoint, exc, wait)
+                logger.warning("Request to %s failed (%s), retrying in %ss (attempt %d/%d)", endpoint, exc, wait, attempt, MAX_RETRIES)
                 time.sleep(wait)
 
         raise RuntimeError(f"Failed to fetch {endpoint} after {MAX_RETRIES} attempts") from last_err

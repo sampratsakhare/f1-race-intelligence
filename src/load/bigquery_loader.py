@@ -86,13 +86,25 @@ class BigQueryLoader:
     def stream_insert(self, table_name: str, rows: list[dict]) -> None:
         """Streaming insert for live polling -- lower latency than batch load,
         appropriate for the small, frequent row counts live polling produces.
+
+        Streaming inserts require the table to already exist (unlike batch
+        loads, which can autodetect + create it). If the table doesn't exist
+        yet -- true the very first time a live session is polled -- fall
+        back to a one-off batch load to create it with an inferred schema,
+        then this and all subsequent calls stream normally.
         """
         if not rows:
             return
 
         errors = self.client.insert_rows_json(self._table_ref(table_name), rows)
         if errors:
-            logger.error("BigQuery streaming insert errors: %s", errors)
+            error_text = str(errors)
+            if "Not found" in error_text or "notFound" in error_text:
+                logger.info("%s doesn't exist yet, creating it via batch load", table_name)
+                self.load_records(table_name, rows, write_disposition="WRITE_APPEND")
+            else:
+                logger.error("BigQuery streaming insert errors: %s", errors)
+                raise RuntimeError(f"Streaming insert into {table_name} failed: {errors}")
         else:
             logger.debug("Streamed %d rows into %s", len(rows), self._table_ref(table_name))
 
