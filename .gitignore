@@ -19,3 +19,4 @@ infra/terraform/*.tfstate
 infra/terraform/*.tfstate.*
 infra/terraform/terraform.tfvars
 crash.log
+data/marts/*.cs
