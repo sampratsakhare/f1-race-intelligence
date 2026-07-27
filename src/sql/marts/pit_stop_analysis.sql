@@ -7,7 +7,7 @@ CREATE OR REPLACE TABLE `PROJECT.DATASET.pit_stop_analysis`
 PARTITION BY DATE(pit_ts)
 CLUSTER BY session_key, driver_number AS
 
-WITH position_before AS (
+WITH pit_stops AS (
     SELECT
         pit.session_key,
         pit.driver_number,
