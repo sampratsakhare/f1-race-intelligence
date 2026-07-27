@@ -1,4 +1,5 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 .env
@@ -7,6 +8,14 @@ data/marts/*.csv
 models/*.joblib
 .streamlit/
 .DS_Store
-data/raw/
-.DS_Store
 **/.DS_Store
+state/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.*
+infra/terraform/terraform.tfvars
+crash.log

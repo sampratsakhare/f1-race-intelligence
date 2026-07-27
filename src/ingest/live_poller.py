@@ -1,190 +1,294 @@
-"""
-Live poller: during an active race session, repeatedly polls OpenF1's
-real-time endpoints and streams new rows into BigQuery.
-
-This is the "real-time analytics" piece of the project. It's intentionally
-a simple polling loop rather than Pub/Sub + Dataflow -- that's a deliberate
-scope choice for a portfolio build (see README "Scaling this up" section).
-
-IMPORTANT: as of OpenF1's current policy, real-time (live-window) data
-requires a paid account and bearer token -- see openf1_client.py and
-https://openf1.org/auth.html. Without one, this script will fail against
-a genuinely live session. For a demoable "real-time" story without paying
-for access, use replay_poller.py instead, which replays already-backfilled
-historical data through this same streaming path at accelerated speed.
-
-Run:
-    python -m src.ingest.live_poller --session-key active --poll-seconds 8
-    python -m src.ingest.live_poller --session-key active --poll-seconds 8 --access-token YOUR_TOKEN
-
-Notes:
-- OpenF1 considers a session "live" from 30 min before it starts to 30 min
-  after it ends. Outside that window, use historical_backfill.py instead.
-- Different endpoints use different timestamp field names (laps use
-  "date_start", most others use "date") -- the watermark is endpoint-aware
-  about this rather than assuming one field name for everything.
-- The watermark only advances AFTER a BigQuery insert is confirmed
-  successful. If an insert fails, those rows are retried on the next poll
-  (which may create a small number of duplicate rows downstream -- safer
-  than the alternative of silently losing data).
-"""
+"""Poll an OpenF1 session into BigQuery with durable endpoint watermarks."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, TypedDict
 
-from src.ingest.openf1_client import OpenF1Client
+from src.ingest.openf1_client import (
+    OpenF1Client,
+    build_event_id,
+    normalize_record_timestamps,
+    normalize_timestamp,
+)
 from src.load.bigquery_loader import BigQueryLoader
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_SECONDS = 8
-LIVE_WINDOW = timedelta(minutes=30)
+DEFAULT_STATE_PATH = Path("state/live_watermarks.json")
 
-# Each OpenF1 endpoint uses a different field name for its timestamp.
-ENDPOINT_DATE_FIELDS = {
-    "laps": "date_start",
-    "position": "date",
-    "intervals": "date",
-    "pit": "date",
+
+class EndpointConfig(TypedDict):
+    table: str
+    timestamp_field: str
+    fetch: Callable[[OpenF1Client, int], list[dict[str, Any]]]
+
+
+ENDPOINTS: dict[str, EndpointConfig] = {
+    "laps": {
+        "table": "raw_live_laps",
+        "timestamp_field": "date_start",
+        "fetch": lambda client, session_key: client.laps(session_key),
+    },
+    "position": {
+        "table": "raw_live_position",
+        "timestamp_field": "date",
+        "fetch": lambda client, session_key: client.position(session_key),
+    },
+    "intervals": {
+        "table": "raw_live_intervals",
+        "timestamp_field": "date",
+        "fetch": lambda client, session_key: client.intervals(session_key),
+    },
+    "pit": {
+        "table": "raw_live_pit",
+        "timestamp_field": "date",
+        "fetch": lambda client, session_key: client.pit(session_key),
+    },
 }
 
 
-def _parse_dt(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-def get_active_session_key(client: OpenF1Client) -> int:
-    """Find the session that's actually live right now (within its 30-min
-    live window on either side), not just the one with the latest scheduled
-    start time -- a naive "max start date" pick can select a future race
-    that hasn't happened yet.
-    """
-    now = datetime.now(timezone.utc)
-    sessions = client.sessions(year=now.year)
+def get_latest_session_key(client: OpenF1Client) -> int:
+    """Resolve OpenF1's documented latest/current session selector."""
+    sessions = client.sessions(session_key="latest")
     if not sessions:
-        raise RuntimeError("No sessions found for current year")
-
-    live_now = []
-    for s in sessions:
-        start = _parse_dt(s["date_start"])
-        end = _parse_dt(s.get("date_end", s["date_start"]))
-        if (start - LIVE_WINDOW) <= now <= (end + LIVE_WINDOW):
-            live_now.append(s)
-
-    if live_now:
-        chosen = min(live_now, key=lambda s: s["date_end"])
-        logger.info("Active session: %s (session_key=%s)", chosen.get("session_name"), chosen["session_key"])
-        return chosen["session_key"]
-
-    # Nothing live right now -- fall back to the most recent past session so
-    # the script is still usable for a quick smoke test outside a race weekend.
-    past = [s for s in sessions if _parse_dt(s.get("date_end", s["date_start"])) <= now]
-    if past:
-        latest_past = max(past, key=lambda s: s["date_start"])
-        logger.warning(
-            "No session is live right now. Falling back to most recent past session: %s (session_key=%s). "
-            "Historical data for it is free; this is fine for testing the pipeline, not a real live demo.",
-            latest_past.get("session_name"), latest_past["session_key"],
-        )
-        return latest_past["session_key"]
-
-    raise RuntimeError("No active or past session found for the current year")
+        raise RuntimeError("OpenF1 returned no latest/current session")
+    latest = max(sessions, key=lambda s: s["date_start"])
+    logger.info("Latest session: %s (%s)", latest.get("session_name"), latest["session_key"])
+    return int(latest["session_key"])
 
 
-class Watermark:
-    """Tracks the last-seen timestamp per endpoint. Rows are only considered
-    "committed" (excluded from future polls) once commit() is called --
-    callers should call commit() only after successfully writing the rows
-    downstream, so a failed write doesn't silently lose data.
-    """
+class DurableWatermark:
+    """Persist the last committed timestamp and boundary IDs per endpoint."""
 
-    def __init__(self):
-        self._seen: dict[str, str] = {}
+    def __init__(self, state_path: Path, session_key: int):
+        self.state_path = state_path
+        self.session_key = session_key
+        self._state = self._load()
 
-    def get_new(self, endpoint: str, rows: list[dict], date_field: str) -> list[dict]:
-        last_seen = self._seen.get(endpoint)
-        return [r for r in rows if not last_seen or r.get(date_field, "") > last_seen]
+    def _load(self) -> dict[str, dict[str, Any]]:
+        if not self.state_path.exists():
+            return {}
+        try:
+            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise RuntimeError(f"Cannot read watermark state {self.state_path}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Invalid watermark state in {self.state_path}")
+        return payload
 
-    def commit(self, endpoint: str, rows: list[dict], date_field: str) -> None:
+    def _key(self, endpoint: str) -> str:
+        return f"{self.session_key}:{endpoint}"
+
+    def filter_new(
+        self,
+        endpoint: str,
+        rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        state = self._state.get(self._key(endpoint), {})
+        last_timestamp = state.get("timestamp")
+        boundary_ids = set(state.get("event_ids_at_timestamp", []))
+        undated_ids = set(state.get("undated_event_ids", []))
+        new_rows = []
+
+        for row in rows:
+            event_id = str(row["_event_id"])
+            event_timestamp = row.get("_source_event_time")
+            if event_timestamp is None:
+                if event_id not in undated_ids:
+                    new_rows.append(row)
+                continue
+
+            if last_timestamp is None or event_timestamp > last_timestamp:
+                new_rows.append(row)
+            elif event_timestamp == last_timestamp and event_id not in boundary_ids:
+                new_rows.append(row)
+
+        return new_rows
+
+    def commit(self, endpoint: str, rows: list[dict[str, Any]]) -> None:
         if not rows:
             return
-        newest = max(r.get(date_field, "") for r in rows)
-        if newest > self._seen.get(endpoint, ""):
-            self._seen[endpoint] = newest
+
+        key = self._key(endpoint)
+        current = self._state.get(key, {})
+        timestamped = [row for row in rows if row.get("_source_event_time") is not None]
+        undated_ids = set(current.get("undated_event_ids", []))
+        undated_ids.update(
+            str(row["_event_id"]) for row in rows if row.get("_source_event_time") is None
+        )
+
+        next_state: dict[str, Any] = {
+            "timestamp": current.get("timestamp"),
+            "event_ids_at_timestamp": current.get("event_ids_at_timestamp", []),
+            # Keep this bounded; documented endpoints should normally be dated.
+            "undated_event_ids": sorted(undated_ids)[-5_000:],
+        }
+
+        if timestamped:
+            max_timestamp = max(str(row["_source_event_time"]) for row in timestamped)
+            max_ids = {
+                str(row["_event_id"])
+                for row in timestamped
+                if row["_source_event_time"] == max_timestamp
+            }
+            if current.get("timestamp") == max_timestamp:
+                max_ids.update(current.get("event_ids_at_timestamp", []))
+            next_state["timestamp"] = max_timestamp
+            next_state["event_ids_at_timestamp"] = sorted(max_ids)
+
+        self._state[key] = next_state
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = self.state_path.with_suffix(f"{self.state_path.suffix}.tmp")
+        temporary_path.write_text(
+            json.dumps(self._state, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        temporary_path.replace(self.state_path)
 
 
-def _poll_endpoint(name: str, fetch_fn, table_name: str, watermark: Watermark, loader: BigQueryLoader) -> int:
-    """Fetch, filter to new rows, insert, and only commit the watermark on
-    success. Returns the number of rows inserted."""
-    date_field = ENDPOINT_DATE_FIELDS[name]
-    rows = fetch_fn()
-    new_rows = watermark.get_new(name, rows, date_field)
+def prepare_rows(
+    endpoint: str,
+    rows: list[dict[str, Any]],
+    timestamp_field: str,
+) -> list[dict[str, Any]]:
+    """Normalize timestamps and add a deterministic ingestion envelope."""
+    ingested_at = datetime.now(UTC).isoformat()
+    prepared = []
 
-    if not new_rows:
-        return 0
+    for raw_row in rows:
+        normalized = normalize_record_timestamps(raw_row)
+        source_event_time = normalize_timestamp(raw_row.get(timestamp_field))
+        event_id = build_event_id(endpoint, normalized)
 
-    loader.stream_insert(table_name, new_rows)   # raises on real failure
-    watermark.commit(name, new_rows, date_field)  # only reached if insert succeeded
-    return len(new_rows)
+        if endpoint == "intervals":
+            for field in ("gap_to_leader", "interval"):
+                if normalized.get(field) is not None:
+                    normalized[field] = str(normalized[field])
+
+        prepared.append(
+            {
+                **normalized,
+                "_event_id": event_id,
+                "_ingested_at": ingested_at,
+                "_source_event_time": source_event_time,
+                "_source_endpoint": endpoint,
+            }
+        )
+
+    return prepared
 
 
-def poll_loop(session_key: int, poll_seconds: int, max_polls: int | None = None) -> None:
-    client = OpenF1Client()
-    loader = BigQueryLoader()
-    watermark = Watermark()
+def poll_loop(
+    session_key: int,
+    poll_seconds: int,
+    max_polls: int | None = None,
+    *,
+    state_path: Path = DEFAULT_STATE_PATH,
+    client: OpenF1Client | None = None,
+    loader: BigQueryLoader | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    client = client or OpenF1Client()
+    loader = loader or BigQueryLoader()
+    loader.ensure_live_tables_exist()
+    watermark = DurableWatermark(state_path, session_key)
 
     poll_count = 0
     logger.info("Starting live poll for session_key=%s every %ss", session_key, poll_seconds)
 
     while max_polls is None or poll_count < max_polls:
         poll_count += 1
-        counts = {}
+        counts: dict[str, int] = {}
 
-        for name, table_name, fetch_fn in [
-            ("laps", "raw_live_laps", lambda: client.laps(session_key)),
-            ("position", "raw_live_position", lambda: client.position(session_key)),
-            ("intervals", "raw_live_intervals", lambda: client.intervals(session_key)),
-            ("pit", "raw_live_pit", lambda: client.pit(session_key)),
-        ]:
+        for endpoint, config in ENDPOINTS.items():
             try:
-                counts[name] = _poll_endpoint(name, fetch_fn, table_name, watermark, loader)
+                raw_rows = config["fetch"](client, session_key)
+                prepared_rows = prepare_rows(
+                    endpoint,
+                    raw_rows,
+                    config["timestamp_field"],
+                )
+                new_rows = watermark.filter_new(endpoint, prepared_rows)
+                if new_rows:
+                    loader.stream_insert(config["table"], new_rows)
+                    # Advance the durable state only after BigQuery confirms success.
+                    watermark.commit(endpoint, new_rows)
+                counts[endpoint] = len(new_rows)
             except Exception:
-                # Log and move on to the next endpoint -- one bad endpoint
-                # shouldn't stop the others from being polled this cycle.
-                logger.exception("Poll %d: %s endpoint failed, will retry next cycle", poll_count, name)
-                counts[name] = 0
+                counts[endpoint] = 0
+                logger.exception(
+                    "Poll %d failed endpoint=%s; state was not advanced",
+                    poll_count,
+                    endpoint,
+                )
 
         logger.info(
-            "Poll %d: +%d laps, +%d positions, +%d intervals, +%d pit stops",
-            poll_count, counts.get("laps", 0), counts.get("position", 0),
-            counts.get("intervals", 0), counts.get("pit", 0),
+            "Poll %d: %s",
+            poll_count,
+            ", ".join(f"+{count} {name}" for name, count in counts.items()),
         )
 
-        time.sleep(poll_seconds)
+        if max_polls is None or poll_count < max_polls:
+            sleep(poll_seconds)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Poll OpenF1 live session data into BigQuery")
-    parser.add_argument("--session-key", default="active",
-                         help="OpenF1 session_key, or 'active' (also accepts legacy 'latest')")
+    parser.add_argument(
+        "--session-key",
+        default="latest",
+        help="OpenF1 session_key, or the documented 'latest' selector",
+    )
     parser.add_argument("--poll-seconds", type=int, default=DEFAULT_POLL_SECONDS)
-    parser.add_argument("--max-polls", type=int, default=None, help="Stop after N polls (for testing)")
-    parser.add_argument("--access-token", default=None,
-                         help="OpenF1 bearer token, required for genuinely live data (paid account)")
+    parser.add_argument(
+        "--max-polls",
+        type=int,
+        default=None,
+        help="Stop after N polls (for testing)",
+    )
+    parser.add_argument(
+        "--state-path",
+        type=Path,
+        default=DEFAULT_STATE_PATH,
+        help="Durable local watermark path",
+    )
+    parser.add_argument(
+        "--reset-state",
+        action="store_true",
+        help="Remove the selected session's local watermark before polling",
+    )
     args = parser.parse_args()
 
-    client = OpenF1Client(access_token=args.access_token)
-    if args.session_key in ("active", "latest"):
-        session_key = get_active_session_key(client)
-    else:
-        session_key = int(args.session_key)
+    client = OpenF1Client()
+    session_key = (
+        get_latest_session_key(client) if args.session_key == "latest" else int(args.session_key)
+    )
 
-    poll_loop(session_key, args.poll_seconds, args.max_polls)
+    if args.reset_state and args.state_path.exists():
+        payload = json.loads(args.state_path.read_text(encoding="utf-8"))
+        prefix = f"{session_key}:"
+        payload = {key: value for key, value in payload.items() if not key.startswith(prefix)}
+        args.state_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    poll_loop(
+        session_key,
+        args.poll_seconds,
+        args.max_polls,
+        state_path=args.state_path,
+        client=client,
+    )
 
 
 if __name__ == "__main__":

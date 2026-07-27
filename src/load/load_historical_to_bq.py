@@ -47,11 +47,16 @@ def _strip_fields(table_name: str, records: list[dict]) -> list[dict]:
     return [{k: v for k, v in record.items() if k not in exclude} for record in records]
 
 
-def main() -> None:
-    loader = BigQueryLoader()
+def load_historical_directory(
+    raw_data_dir: Path,
+    loader: BigQueryLoader,
+) -> None:
+    """Load all endpoint files from a historical backfill into raw tables."""
     loader.ensure_dataset_exists()
 
-    json_files = sorted(RAW_DATA_DIR.rglob("*.json"))
+    json_files = sorted(
+        path for path in raw_data_dir.rglob("*.json") if not path.name.startswith("_")
+    )
     logger.info("Found %d raw JSON files to load", len(json_files))
 
     files_by_table: dict[str, list[Path]] = defaultdict(list)
@@ -61,13 +66,18 @@ def main() -> None:
 
     logger.info("Grouped into %d tables: %s", len(files_by_table), sorted(files_by_table))
 
+    failures: list[str] = []
     for table_name, paths in sorted(files_by_table.items()):
         all_records = []
         for path in paths:
             try:
-                all_records.extend(json.loads(path.read_text()))
-            except Exception:
-                logger.exception("Failed to read %s, skipping this file", path)
+                payload = json.loads(path.read_text())
+                if not isinstance(payload, list):
+                    raise ValueError("expected a top-level JSON list")
+                all_records.extend(payload)
+            except Exception as exc:
+                failures.append(f"{path}: {exc}")
+                logger.exception("Failed to read %s", path)
 
         if not all_records:
             logger.warning("No records found for %s, skipping table", table_name)
@@ -77,8 +87,19 @@ def main() -> None:
 
         try:
             loader.load_records(table_name, all_records, write_disposition="WRITE_TRUNCATE")
-        except Exception:
-            logger.exception("Failed to load table %s, skipping", table_name)
+        except Exception as exc:
+            failures.append(f"{table_name}: {exc}")
+            logger.exception("Failed to load table %s", table_name)
+
+    if failures:
+        raise RuntimeError(
+            f"Historical load completed with {len(failures)} failures; "
+            "inspect the logs before running transformations"
+        )
+
+
+def main() -> None:
+    load_historical_directory(RAW_DATA_DIR, BigQueryLoader())
 
 
 if __name__ == "__main__":
