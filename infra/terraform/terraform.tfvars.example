@@ -1,0 +1,10 @@
+project_id      = "your-gcp-project-id"
+region          = "us-central1"
+raw_bucket_name = "your-globally-unique-f1-raw-bucket"
+
+# First apply with deploy_services=false to create Artifact Registry.
+# Build and push both images, then set these values and apply again.
+deploy_services = false
+consumer_image  = ""
+dashboard_image = ""
+dashboard_public = false

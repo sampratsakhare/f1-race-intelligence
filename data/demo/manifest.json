@@ -1,0 +1,18 @@
+{
+  "files": [
+    "driver_race_performance.csv",
+    "pit_stop_analysis.csv",
+    "live_snapshot.csv",
+    "live_sessions.csv",
+    "model_metrics.json"
+  ],
+  "generated_at": "2026-07-27T05:13:18.092490+00:00",
+  "latest_detailed_race": "Yas Marina Circuit",
+  "latest_detailed_session_key": 9839,
+  "race_rows": 958,
+  "source": "https://api.openf1.org/v1",
+  "years": [
+    2024,
+    2025
+  ]
+}
