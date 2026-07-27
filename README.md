@@ -88,6 +88,11 @@ supervised metrics. These numbers describe this fixed snapshot, not guaranteed
 future performance; `make demo-data` and `make train` make the result
 rerunnable.
 
+For the analyst narrative—not only the pipeline—see
+[the 2024–2025 case study](docs/CASE_STUDY.md). It covers grid predictiveness,
+team reliability, the detailed Yas Marina race, model interpretation, and the
+limits of pit-stop comparisons.
+
 ## Repository map
 
 ```text
@@ -115,6 +120,7 @@ src/
   ml/
     train_model.py               Leakage-safe LightGBM evaluation and gate
 tests/                           Unit and contract tests
+docs/                            Metric dictionary, case study, runbook
 ```
 
 ## Quick start
