@@ -1,7 +1,7 @@
-google-cloud-bigquery>=3.20,<4
-pandas>=2.2,<3
-pyarrow>=17,<21
-db-dtypes>=1.2,<2
-python-dotenv>=1.0,<2
+google-cloud-bigquery>=3.42.3,<4
+pandas>=3.0.5,<4
+pyarrow>=25.0.0,<26
+db-dtypes>=1.7.1,<2
+python-dotenv>=1.2.2,<2
 streamlit>=1.60,<2
-altair>=5.4,<7
+altair>=6.2.2,<7
